@@ -9,7 +9,7 @@ Interactive Streamlit dashboard for Dutch renewable energy capacity factor data,
 ## Features
 
 - **Dynamic API integration** — fetches hourly capacity factor data from `api.ned.nl` for Solar, Wind Onshore, and Wind Offshore
-- **Smart caching** — stores data per year in `energy_data_ned.xlsx`; skips already-downloaded years
+- **Smart caching & Incremental Updates** — stores data per year in `energy_data_ned.xlsx`. Completely skips already-downloaded historical years, and incrementally fetches only missing new records for the current ongoing year.
 - **Autonomous data verification** — completeness, Full Load Hours, and physics checks with color-coded reports
 - **Individual Profiles** — line chart of capacity factors (0–1) with per-source toggles
 - **Stacked Simulation** — configurable installed capacity (GW) to simulate combined renewable power output
@@ -103,7 +103,8 @@ Simulation for the Dutch power grid using historical data from the Nationaal Ene
 
 - File: `energy_data_ned.xlsx`
 - Check if file exists → load with `pd.ExcelFile`
-- Check if the specific year already exists as a sheet → SKIP downloading (prevents API waste)
+- **Past Years**: Check if the specific year already exists as a sheet → SKIP downloading completely (prevents API waste).
+- **Current Year**: Check if the year exists. If yes, dynamically find the latest cached timestamp and incrementally fetch only new data from that point forward, appending to the cache.
 
 ### 2. Autonomous Self-Verification
 
