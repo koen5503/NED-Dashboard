@@ -184,12 +184,14 @@ def get_type_mapping(api_key: str) -> dict[str, int]:
     return mapping
 
 
-def fetch_year_data(api_key: str, type_id: int, year: int) -> pd.Series:
+def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | None = None) -> pd.Series:
     """
     Fetch hourly percentage (capacity factor) for one source/year.
     Uses JSON-LD format for hydra:next pagination.
     Returns a pandas Series indexed by UTC timestamp.
     """
+    if start_date is None:
+        start_date = f"{year}-01-01"
     # Initial request uses params dict for proper URL encoding
     initial_params = {
         "point": 0,
@@ -198,7 +200,7 @@ def fetch_year_data(api_key: str, type_id: int, year: int) -> pd.Series:
         "granularitytimezone": 0,     # UTC
         "classification": 2,         # Current (actual)
         "activity": 1,               # Providing
-        "validfrom[after]": f"{year}-01-01",
+        "validfrom[after]": start_date,
         "validfrom[strictly_before]": f"{year + 1}-01-01",
         "itemsPerPage": 200,         # reduce page count
     }
@@ -455,27 +457,56 @@ def main():
         st.info(f"Resolved types: {type_map}")
 
         for yr in years:
-            if yr in all_data:
+            if yr in all_data and yr < current_year:
                 st.info(f"📋 Year {yr} already cached — skipping download.")
                 continue
 
-            st.subheader(f"Fetching {yr}...")
+            # For current year, fetch incrementally starting from latest timestamp
+            start_date_param = None
+            if yr in all_data and yr == current_year:
+                last_dt = all_data[yr].index.max()
+                if pd.notnull(last_dt):
+                    # API uses > validation for [after], so requesting the same day is fine.
+                    # Duplicates are dropped later. We request from the date of the last timestamp.
+                    start_date_param = last_dt.strftime("%Y-%m-%d")
+                    st.info(f"🔄 Current year {yr} partially cached. Fetching updates from {start_date_param}...")
+            else:
+                st.subheader(f"Fetching {yr}...")
+
             year_frames: dict[str, pd.Series] = {}
 
             for label, tid in type_map.items():
                 with st.spinner(f"  ↳ {label} ({yr})..."):
-                    series = fetch_year_data(api_key, tid, yr)
+                    series = fetch_year_data(api_key, tid, yr, start_date=start_date_param)
                     if not series.empty:
                         year_frames[label] = series
 
             if year_frames:
-                df_year = pd.DataFrame(year_frames)
-                df_year.index.name = "timestamp_utc"
+                df_new = pd.DataFrame(year_frames)
+                df_new.index.name = "timestamp_utc"
+                
+                # If updating the current year, merge with existing
+                if yr in all_data and yr == current_year:
+                    # Concat places new data after old data.
+                    df_year = pd.concat([all_data[yr], df_new])
+                    # Keep the last fetched value (new data) in case of overlap
+                    df_year = df_year[~df_year.index.duplicated(keep="last")]
+                    # Sort after deduplication
+                    df_year = df_year.sort_index()
+                else:
+                    df_year = df_new
+
                 save_year(EXCEL_FILE, yr, df_year)
                 all_data[yr] = df_year
-                st.success(f"✅ {yr}: saved {len(df_year)} rows to {EXCEL_FILE}")
+                if start_date_param:
+                    st.success(f"✅ {yr}: appended {len(df_new)} new rows, total {len(df_year)} rows saved.")
+                else:
+                    st.success(f"✅ {yr}: saved {len(df_year)} rows to {EXCEL_FILE}")
             else:
-                st.warning(f"⚠️ No data retrieved for {yr}.")
+                if yr in all_data and yr == current_year:
+                    st.info(f"✨ Year {yr} is fully up to date.")
+                else:
+                    st.warning(f"⚠️ No data retrieved for {yr}.")
 
     # ── Nothing loaded? ──
     if not all_data:
