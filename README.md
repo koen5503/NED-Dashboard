@@ -14,12 +14,13 @@ Interactive Streamlit dashboard for Dutch renewable energy capacity factor data,
 - **Individual Profiles** — line chart of capacity factors (0–1) with per-source toggles
 - **Stacked Simulation** — configurable installed capacity (GW) to simulate combined renewable power output
 - **HAL/JSON-LD pagination** — handles the NED API's paginated responses transparently
+- **TTF gas prices** — fetches Dutch TTF Natural Gas day-ahead prices from Yahoo Finance (`yfinance`), cached with incremental updates
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install streamlit pandas requests openpyxl plotly
+pip install streamlit pandas requests openpyxl plotly yfinance
 
 # Run the dashboard
 streamlit run ned_dashboard.py

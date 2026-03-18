@@ -18,6 +18,12 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
 # ── Constants ──────────────────────────────────────────────────────────
 BASE_URL = "https://api.ned.nl/v1"
 EXCEL_FILE = "energy_data_ned.xlsx"
@@ -341,6 +347,61 @@ def save_year(path: str, year: int, df: pd.DataFrame):
             df_out.to_excel(writer, sheet_name=sn)
 
 
+GAS_SHEET = "Gas_TTF"
+
+
+def fetch_gas_prices(start_date: str | None = None) -> pd.DataFrame:
+    """
+    Fetch daily Dutch TTF Natural Gas Futures close prices (EUR/MWh)
+    from Yahoo Finance via yfinance.  Returns a DataFrame with date index.
+    """
+    if not HAS_YFINANCE:
+        st.error(
+            "⚠️ `yfinance` is not installed.  "
+            "Run `pip install yfinance` and restart the app."
+        )
+        return pd.DataFrame()
+
+    ticker = yf.Ticker("TTF=F")
+    if start_date:
+        hist = ticker.history(start=start_date, interval="1d")
+    else:
+        hist = ticker.history(period="max", interval="1d")
+
+    if hist.empty:
+        return pd.DataFrame()
+
+    df = hist[["Close"]].rename(columns={"Close": "TTF_EUR_MWh"})
+    df.index = df.index.tz_localize(None)  # strip tz for Excel compat
+    df.index.name = "date"
+    return df
+
+
+def load_gas_prices(path: str) -> pd.DataFrame:
+    """Load cached gas price data from the Excel file."""
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        xls = pd.ExcelFile(path, engine="openpyxl")
+        if GAS_SHEET in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=GAS_SHEET, index_col=0, engine="openpyxl")
+            df.index = pd.to_datetime(df.index)
+            return df
+    except Exception as exc:
+        st.warning(f"Could not read gas price sheet: {exc}")
+    return pd.DataFrame()
+
+
+def save_gas_prices(path: str, df: pd.DataFrame):
+    """Save gas price data to the Gas_TTF sheet in the Excel file."""
+    if os.path.exists(path):
+        with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+            df.to_excel(w, sheet_name=GAS_SHEET)
+    else:
+        with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
+            df.to_excel(w, sheet_name=GAS_SHEET)
+
+
 # ── Data quality verification ─────────────────────────────────────────
 def verify_data(df: pd.DataFrame, year: int) -> pd.DataFrame:
     """
@@ -508,154 +569,218 @@ def main():
                 else:
                     st.warning(f"⚠️ No data retrieved for {yr}.")
 
+    # ── Gas prices ──
+    gas_df = load_gas_prices(EXCEL_FILE)
+
+    if fetch_btn or st.sidebar.button("⛽ Fetch Gas Prices", use_container_width=True):
+        with st.spinner("Fetching TTF gas prices from Yahoo Finance..."):
+            start = None
+            if not gas_df.empty:
+                start = (gas_df.index.max() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                st.info(f"🔄 Updating gas prices from {start}...")
+            new_gas = fetch_gas_prices(start_date=start)
+            if not new_gas.empty:
+                if not gas_df.empty:
+                    gas_df = pd.concat([gas_df, new_gas])
+                    gas_df = gas_df[~gas_df.index.duplicated(keep="last")].sort_index()
+                else:
+                    gas_df = new_gas
+                save_gas_prices(EXCEL_FILE, gas_df)
+                st.success(f"✅ Gas prices: {len(gas_df)} days cached.")
+            elif gas_df.empty:
+                st.warning("No gas price data retrieved.")
+
     # ── Nothing loaded? ──
-    if not all_data:
+    if not all_data and gas_df.empty:
         st.info("No data loaded yet. Enter your API key and click **Fetch Data** to begin.")
         st.stop()
 
     # ── Verification ──
-    st.header("📊 Data Quality Report")
+    if all_data:
+        st.header("📊 Data Quality Report")
+        for yr in sorted(all_data.keys()):
+            df = all_data[yr]
+            report = verify_data(df, yr)
+            st.subheader(f"Year {yr}")
+            st.dataframe(report, use_container_width=True)
+            # Apply physics clamping
+            all_data[yr] = clamp_physics(df)
 
-    for yr in sorted(all_data.keys()):
-        df = all_data[yr]
-        report = verify_data(df, yr)
-        st.subheader(f"Year {yr}")
-        st.dataframe(report, use_container_width=True)
-        # Apply physics clamping
-        all_data[yr] = clamp_physics(df)
+        # ── Combine all years ──
+        combined = pd.concat(all_data.values()).sort_index()
+        combined = combined[~combined.index.duplicated(keep="first")]
 
-    # ── Combine all years ──
-    combined = pd.concat(all_data.values()).sort_index()
-    combined = combined[~combined.index.duplicated(keep="first")]
+        # ── Dashboard controls ──
+        st.header("📈 Dashboard")
 
-    # ── Dashboard controls ──
-    st.header("📈 Dashboard")
+        # Date range slider
+        min_dt = combined.index.min().to_pydatetime()
+        max_dt = combined.index.max().to_pydatetime()
 
-    # Date range slider
-    min_dt = combined.index.min().to_pydatetime()
-    max_dt = combined.index.max().to_pydatetime()
+        # Default view: Jan 1–14 of the first year
+        first_year = min(all_data.keys())
+        default_start = datetime.datetime(first_year, 1, 1, tzinfo=datetime.timezone.utc)
+        default_end = datetime.datetime(first_year, 1, 14, 23, 0, tzinfo=datetime.timezone.utc)
+        default_start = max(default_start, min_dt)
+        default_end = min(default_end, max_dt)
 
-    # Default view: Jan 1–14 of the first year
-    first_year = min(all_data.keys())
-    default_start = datetime.datetime(first_year, 1, 1, tzinfo=datetime.timezone.utc)
-    default_end = datetime.datetime(first_year, 1, 14, 23, 0, tzinfo=datetime.timezone.utc)
-    default_start = max(default_start, min_dt)
-    default_end = min(default_end, max_dt)
+        date_range = st.slider(
+            "Select date range",
+            min_value=min_dt,
+            max_value=max_dt,
+            value=(default_start, default_end),
+            format="YYYY-MM-DD HH:mm",
+        )
 
-    date_range = st.slider(
-        "Select date range",
-        min_value=min_dt,
-        max_value=max_dt,
-        value=(default_start, default_end),
-        format="YYYY-MM-DD HH:mm",
-    )
+        mask = (combined.index >= pd.Timestamp(date_range[0])) & (combined.index <= pd.Timestamp(date_range[1]))
+        df_view = combined.loc[mask]
 
-    mask = (combined.index >= pd.Timestamp(date_range[0])) & (combined.index <= pd.Timestamp(date_range[1]))
-    df_view = combined.loc[mask]
-
-    if df_view.empty:
-        st.warning("No data in the selected range.")
-        st.stop()
-
-    # View mode
-    view_mode = st.radio("View Mode", ["Individual Profiles", "Stacked Simulation"], horizontal=True)
-
-    # ── Graph 1: Individual Profiles ──
-    if view_mode == "Individual Profiles":
-        cols_to_show = []
-        cb_col1, cb_col2, cb_col3 = st.columns(3)
-        with cb_col1:
-            if st.checkbox("Solar", value=True):
-                cols_to_show.append("Solar")
-        with cb_col2:
-            if st.checkbox("Wind Onshore", value=True):
-                cols_to_show.append("Wind Onshore")
-        with cb_col3:
-            if st.checkbox("Wind Offshore", value=True):
-                cols_to_show.append("Wind Offshore")
-
-        if not cols_to_show:
-            st.info("Select at least one source.")
+        if df_view.empty:
+            st.warning("No data in the selected range.")
             st.stop()
 
-        colors = {"Solar": "#FFB300", "Wind Onshore": "#43A047", "Wind Offshore": "#1E88E5"}
+        # View mode
+        view_mode = st.radio("View Mode", ["Individual Profiles", "Stacked Simulation"], horizontal=True)
 
-        fig = go.Figure()
-        for col in cols_to_show:
-            if col in df_view.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_view.index,
-                    y=df_view[col],
-                    mode="lines",
-                    name=col,
-                    line=dict(color=colors.get(col, None), width=1),
-                ))
+        # ── Graph 1: Individual Profiles ──
+        if view_mode == "Individual Profiles":
+            cols_to_show = []
+            cb_col1, cb_col2, cb_col3 = st.columns(3)
+            with cb_col1:
+                if st.checkbox("Solar", value=True):
+                    cols_to_show.append("Solar")
+            with cb_col2:
+                if st.checkbox("Wind Onshore", value=True):
+                    cols_to_show.append("Wind Onshore")
+            with cb_col3:
+                if st.checkbox("Wind Offshore", value=True):
+                    cols_to_show.append("Wind Offshore")
 
-        fig.update_layout(
-            title="Capacity Factor Profiles",
-            yaxis=dict(title="Capacity Factor", range=[0, 1.05]),
-            xaxis=dict(title="Time (UTC)"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            height=500,
+            if not cols_to_show:
+                st.info("Select at least one source.")
+                st.stop()
+
+            colors = {"Solar": "#FFB300", "Wind Onshore": "#43A047", "Wind Offshore": "#1E88E5"}
+
+            fig = go.Figure()
+            for col in cols_to_show:
+                if col in df_view.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df_view.index,
+                        y=df_view[col],
+                        mode="lines",
+                        name=col,
+                        line=dict(color=colors.get(col, None), width=1),
+                    ))
+
+            fig.update_layout(
+                title="Capacity Factor Profiles",
+                yaxis=dict(title="Capacity Factor", range=[0, 1.05]),
+                xaxis=dict(title="Time (UTC)"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                height=500,
+                template="plotly_white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Graph 2: Stacked Simulation ──
+        else:
+            st.subheader("Installed Capacity Assumptions")
+            sim_col1, sim_col2, sim_col3 = st.columns(3)
+            with sim_col1:
+                cap_solar = st.number_input("Solar (GW)", min_value=0.0, value=10.0, step=1.0)
+            with sim_col2:
+                cap_onshore = st.number_input("Wind Onshore (GW)", min_value=0.0, value=10.0, step=1.0)
+            with sim_col3:
+                cap_offshore = st.number_input("Wind Offshore (GW)", min_value=0.0, value=10.0, step=1.0)
+
+            # Compute P(t) = C × CF(t)  — GW × capacity factor = GW output
+            p_solar = df_view.get("Solar", pd.Series(0, index=df_view.index)) * cap_solar
+            p_onshore = df_view.get("Wind Onshore", pd.Series(0, index=df_view.index)) * cap_onshore
+            p_offshore = df_view.get("Wind Offshore", pd.Series(0, index=df_view.index)) * cap_offshore
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=df_view.index, y=p_solar,
+                mode="lines", name="Solar",
+                line=dict(width=0), fillcolor="rgba(255, 179, 0, 0.6)",
+                stackgroup="one",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df_view.index, y=p_onshore,
+                mode="lines", name="Wind Onshore",
+                line=dict(width=0), fillcolor="rgba(67, 160, 71, 0.6)",
+                stackgroup="one",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df_view.index, y=p_offshore,
+                mode="lines", name="Wind Offshore",
+                line=dict(width=0), fillcolor="rgba(30, 136, 229, 0.6)",
+                stackgroup="one",
+            ))
+
+            fig.update_layout(
+                title="Simulated Renewable Power Output",
+                yaxis=dict(title="Power Output (GW)"),
+                xaxis=dict(title="Time (UTC)"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                height=500,
+                template="plotly_white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Summary stats for the selected range
+            total = p_solar + p_onshore + p_offshore
+            st.markdown(f"""
+            **Selected range statistics:**
+            - Peak combined output: **{total.max():.1f} GW**
+            - Average combined output: **{total.mean():.1f} GW**
+            - Minimum combined output: **{total.min():.1f} GW**
+            - Total energy: **{total.sum() / 1000:.1f} TWh** (assuming hourly data)
+            """)
+
+    # ── Gas Price Chart ──
+    if not gas_df.empty:
+        st.header("⛽ TTF Natural Gas — Day Ahead Price")
+
+        if all_data:
+            gas_mask = (
+                (gas_df.index >= pd.Timestamp(date_range[0]).tz_localize(None))
+                & (gas_df.index <= pd.Timestamp(date_range[1]).tz_localize(None))
+            )
+            gas_view = gas_df.loc[gas_mask]
+        else:
+            gas_view = pd.DataFrame()
+
+        if gas_view.empty:
+            # Show full gas range if the energy date slider doesn't overlap
+            gas_view = gas_df
+            st.caption("Showing full available gas price range.")
+
+        fig_gas = go.Figure()
+        fig_gas.add_trace(go.Scatter(
+            x=gas_view.index,
+            y=gas_view["TTF_EUR_MWh"],
+            mode="lines",
+            name="TTF Day Ahead",
+            line=dict(color="#FF6F00", width=2),
+        ))
+        fig_gas.update_layout(
+            title="Dutch TTF Natural Gas Price",
+            yaxis=dict(title="Price (EUR/MWh)"),
+            xaxis=dict(title="Date"),
+            height=400,
             template="plotly_white",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_gas, use_container_width=True)
 
-    # ── Graph 2: Stacked Simulation ──
-    else:
-        st.subheader("Installed Capacity Assumptions")
-        sim_col1, sim_col2, sim_col3 = st.columns(3)
-        with sim_col1:
-            cap_solar = st.number_input("Solar (GW)", min_value=0.0, value=10.0, step=1.0)
-        with sim_col2:
-            cap_onshore = st.number_input("Wind Onshore (GW)", min_value=0.0, value=10.0, step=1.0)
-        with sim_col3:
-            cap_offshore = st.number_input("Wind Offshore (GW)", min_value=0.0, value=10.0, step=1.0)
-
-        # Compute P(t) = C × CF(t)  — GW × capacity factor = GW output
-        p_solar = df_view.get("Solar", pd.Series(0, index=df_view.index)) * cap_solar
-        p_onshore = df_view.get("Wind Onshore", pd.Series(0, index=df_view.index)) * cap_onshore
-        p_offshore = df_view.get("Wind Offshore", pd.Series(0, index=df_view.index)) * cap_offshore
-
-        fig = go.Figure()
-
-        fig.add_trace(go.Scatter(
-            x=df_view.index, y=p_solar,
-            mode="lines", name="Solar",
-            line=dict(width=0), fillcolor="rgba(255, 179, 0, 0.6)",
-            stackgroup="one",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_view.index, y=p_onshore,
-            mode="lines", name="Wind Onshore",
-            line=dict(width=0), fillcolor="rgba(67, 160, 71, 0.6)",
-            stackgroup="one",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_view.index, y=p_offshore,
-            mode="lines", name="Wind Offshore",
-            line=dict(width=0), fillcolor="rgba(30, 136, 229, 0.6)",
-            stackgroup="one",
-        ))
-
-        fig.update_layout(
-            title="Simulated Renewable Power Output",
-            yaxis=dict(title="Power Output (GW)"),
-            xaxis=dict(title="Time (UTC)"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            height=500,
-            template="plotly_white",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Summary stats for the selected range
-        total = p_solar + p_onshore + p_offshore
         st.markdown(f"""
-        **Selected range statistics:**
-        - Peak combined output: **{total.max():.1f} GW**
-        - Average combined output: **{total.mean():.1f} GW**
-        - Minimum combined output: **{total.min():.1f} GW**
-        - Total energy: **{total.sum() / 1000:.1f} TWh** (assuming hourly data)
+        **Gas price statistics ({gas_view.index.min().date()} — {gas_view.index.max().date()}):**
+        - Current: **€{gas_view['TTF_EUR_MWh'].iloc[-1]:.2f}/MWh**
+        - Average: **€{gas_view['TTF_EUR_MWh'].mean():.2f}/MWh**
+        - Min: **€{gas_view['TTF_EUR_MWh'].min():.2f}/MWh**
+        - Max: **€{gas_view['TTF_EUR_MWh'].max():.2f}/MWh**
         """)
 
 
