@@ -657,8 +657,12 @@ def main():
         # ── Virtual Columns ──
         if "Electricity Import (MW)" in combined.columns and "Electricity Export (MW)" in combined.columns:
             combined["Electricity Net Import (MW)"] = combined["Electricity Import (MW)"] - combined["Electricity Export (MW)"]
+            combined["Electricity Net Export (MW)"] = combined["Electricity Export (MW)"] - combined["Electricity Import (MW)"]
             # Add to SOURCE_LABELS dynamically for selection
-            SOURCE_LABELS["Electricity Net Import"] = {"name": "Virtual"}
+            if "Electricity Net Import" not in SOURCE_LABELS:
+                SOURCE_LABELS["Electricity Net Import"] = {"name": "Virtual"}
+            if "Electricity Net Export" not in SOURCE_LABELS:
+                SOURCE_LABELS["Electricity Net Export"] = {"name": "Virtual"}
 
         # ── Dashboard controls ──
         st.header("📈 Dashboard")
@@ -722,7 +726,8 @@ def main():
             "Biogas": "#8D6E63", "Nuclear": "#00E5FF", "Fossil Gas": "#B0BEC5",
             "Fossil Coal": "#263238", "Waste": "#7E57C2", "Biomass": "#C0CA33",
             "Electricity Load": "#D81B60", "Electricity Import": "#00897B", 
-            "Electricity Export": "#F4511E", "Electricity Net Import": "#004D40"
+            "Electricity Export": "#F4511E", "Electricity Net Import": "#004D40",
+            "Electricity Net Export": "#E64A19"
         }
 
         # ── Graph 1: Individual Profiles ──
@@ -755,7 +760,7 @@ def main():
             
             st.plotly_chart(fig, use_container_width=True)
 
-        # ── Graph 2: Stacked Generation ──
+        # ── Graph 2: Stacked View ──
         else:
             if data_type == "Capacity Factor (%)":
                 st.subheader("Simulated Generation (Installed Capacity Assumptions)")
@@ -774,58 +779,140 @@ def main():
                     if col in df_view.columns:
                         plot_data[label] = df_view[col] * caps[label]
                 
-                title = "Simulated Renewable Power Output"
-                y_title = "Power Output (GW)"
+                if plot_data:
+                    fig = go.Figure()
+                    for label, series in plot_data.items():
+                        fig.add_trace(go.Scatter(
+                            x=df_view.index, y=series,
+                            mode="lines", name=label,
+                            line=dict(width=0), 
+                            fillcolor=colors.get(label, "grey"),
+                            stackgroup="one",
+                        ))
+                    fig.update_layout(
+                        title="Simulated Renewable Power Output",
+                        yaxis=dict(title="Power Output (GW)"),
+                        xaxis=dict(title="Time (UTC)"),
+                        height=500,
+                        template="plotly_white",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    total = pd.DataFrame(plot_data).sum(axis=1)
+                    st.markdown(f"**Total Peak: {total.max():.1f} GW / Average: {total.mean():.1f} GW**")
+                else:
+                    st.warning("No % data for selected sources.")
+
             else:
-                st.subheader("Actual Hourly Generation Stack")
-                plot_data = {
-                    label: df_view[f"{label} (MW)"]
-                    for label in selected_sources if f"{label} (MW)" in df_view.columns
+                # ── Production Mode (MW) — Two Charts ──
+                
+                # Identify production sources vs system sources
+                system_names = {"Electricity Load", "Electricity Import", "Electricity Export", 
+                                "Electricity Net Import", "Electricity Net Export"}
+                gen_sources = [s for s in selected_sources if s not in system_names]
+                
+                st.subheader("1. All Production Sources")
+                gen_data = {
+                    s: df_view[f"{s} (MW)"] 
+                    for s in gen_sources if f"{s} (MW)" in df_view.columns
                 }
-                title = "Actual Power Generation (from NED API)"
-                y_title = "Power Output (MW)"
+                
+                if gen_data:
+                    fig1 = go.Figure()
+                    for label, series in gen_data.items():
+                        fig1.add_trace(go.Scatter(
+                            x=df_view.index, y=series,
+                            mode="lines", name=label,
+                            line=dict(width=0), fillcolor=colors.get(label, "grey"),
+                            stackgroup="one",
+                        ))
+                    fig1.update_layout(
+                        title="Total Hourly Production Stack (MW)",
+                        yaxis=dict(title="Power (MW)"),
+                        xaxis=dict(title="Time (UTC)"),
+                        height=450,
+                        template="plotly_white",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig1, use_container_width=True)
+                    
+                    total_gen = pd.DataFrame(gen_data).sum(axis=1)
+                    st.markdown(f"**Combined Production — Peak: {total_gen.max():.0f} MW / Average: {total_gen.mean():.0f} MW**")
+                else:
+                    st.info("Select production sources (Solar, Wind, Nuclear, etc.) to see the stack.")
 
-            if not plot_data:
-                st.warning(f"No {data_type} data available for the selected sources & range.")
-            else:
-                fig = go.Figure()
-                for label, series in plot_data.items():
-                    fig.add_trace(go.Scatter(
-                        x=df_view.index, y=series,
-                        mode="lines", name=label,
-                        line=dict(width=0), 
-                        fillcolor=colors.get(label, "grey"),
-                        stackgroup="one",
-                    ))
+                st.divider()
 
-                fig.update_layout(
-                    title=title,
-                    yaxis=dict(title=y_title),
+                st.subheader("2. Electricity Balance")
+                st.caption("Stack of Load and Net Export, with Total Production as a line.")
+                
+                # Total Production for balance line (all generation in data, not just selected)
+                all_gen_cols = [f"{s} (MW)" for s in SOURCE_LABELS if s not in system_names]
+                all_gen_cols = [c for c in all_gen_cols if c in df_view.columns]
+                total_prod_series = df_view[all_gen_cols].sum(axis=1) if all_gen_cols else pd.Series(0, index=df_view.index)
+
+                load = df_view.get("Electricity Load (MW)", pd.Series(0, index=df_view.index))
+                net_export = df_view.get("Electricity Net Export (MW)", pd.Series(0, index=df_view.index))
+
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(
+                    x=df_view.index, y=load,
+                    mode="lines", name="Electricity Load",
+                    line=dict(width=0), fillcolor=colors.get("Electricity Load", "#D81B60"),
+                    stackgroup="one",
+                ))
+                fig2.add_trace(go.Scatter(
+                    x=df_view.index, y=net_export,
+                    mode="lines", name="Net Export",
+                    line=dict(width=0), fillcolor=colors.get("Electricity Net Export", "#E64A19"),
+                    stackgroup="one",
+                ))
+                fig2.add_trace(go.Scatter(
+                    x=df_view.index, y=total_prod_series,
+                    mode="lines", name="Total Production (Line)",
+                    line=dict(color="#FFD600", width=3),
+                ))
+
+                fig2.update_layout(
+                    title="Load + Net Export vs Production",
+                    yaxis=dict(title="Power (MW)"),
                     xaxis=dict(title="Time (UTC)"),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    height=550,
+                    height=450,
                     template="plotly_white",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig2, use_container_width=True)
+                
+                st.info("💡 ProTip: Total Production (line) should equal the top of the Load+Net Export stack.")
 
-                # Summary stats for the selected range
-                total = pd.DataFrame(plot_data).sum(axis=1)
-                unit = "GW" if data_type == "Capacity Factor (%)" else "MW"
-                # ... rest of summary stats logic stays the same ...
-
-            # Summary stats for the selected range
-            total = pd.DataFrame(plot_data).sum(axis=1)
-            unit = "GW" if data_type == "Capacity Factor (%)" else "MW"
-            total_unit = "TWh" if data_type == "Capacity Factor (%)" else "GWh"
-            divisor = 1000.0
-            
-            st.markdown(f"""
-            **Selected range statistics ({data_type}):**
-            - Peak combined output: **{total.max():.1f} {unit}**
-            - Average combined output: **{total.mean():.1f} {unit}**
-            - Minimum combined output: **{total.min():.1f} {unit}**
-            - Total energy: **{total.sum() / divisor:.1f} {total_unit}** (assuming hourly data)
-            """)
+            # ── Summary Statistics (Global) ──
+            if not df_view.empty:
+                st.divider()
+                st.subheader("📈 Range Summary Statistics")
+                
+                # Use all available production columns for global stats
+                all_gen_cols = [f"{s} (MW)" for s in SOURCE_LABELS if s not in system_names]
+                all_gen_cols = [c for c in all_gen_cols if c in df_view.columns]
+                
+                if all_gen_cols:
+                    total_mw = df_view[all_gen_cols].sum(axis=1)
+                    divisor = 1000.0 # MW -> GWh
+                    st.markdown(f"""
+                    **Production Stats:**
+                    - Peak Production: **{total_mw.max():.0f} MW**
+                    - Average Production: **{total_mw.mean():.0f} MW**
+                    - Total Energy Produced: **{total_mw.sum() / divisor:.1f} GWh**
+                    """)
+                
+                if "Electricity Load (MW)" in df_view.columns:
+                    load_mw = df_view["Electricity Load (MW)"]
+                    st.markdown(f"""
+                    **Load Stats:**
+                    - Peak Load: **{load_mw.max():.0f} MW**
+                    - Average Load: **{load_mw.mean():.0f} MW**
+                    - Total Energy Consumed: **{load_mw.sum() / 1000.0:.1f} GWh**
+                    """)
 
     # ── Gas Price Chart ──
     if not gas_df.empty:
