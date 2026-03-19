@@ -32,19 +32,21 @@ EXCEL_FILE = "energy_data_ned.xlsx"
 # (The NED API uses English names, not Dutch.  The FSD's Dutch names
 #  "Zonne-energie", "Wind op land", "Wind op zee" map to the API names below.)
 SOURCE_LABELS = {
-    "Solar": "Solar",
-    "Wind Onshore": "Wind",
-    "Wind Offshore": "WindOffshoreC",
-    "Biogas": "Biogas",
-    "Nuclear": "Nuclear",
-    "Fossil Gas": "FossilGasPower",
-    "Fossil Coal": "FossilHardCoal",
-    "Waste": "WastePower",
-    "Biomass": "BiomassPower",
+    "Solar": {"name": "Solar"},
+    "Wind Onshore": {"name": "Wind"},
+    "Wind Offshore": {"name": "WindOffshoreC"},
+    "Biogas": {"name": "Biogas"},
+    "Nuclear": {"name": "Nuclear"},
+    "Fossil Gas": {"name": "FossilGasPower"},
+    "Fossil Coal": {"name": "FossilHardCoal"},
+    "Waste": {"name": "WastePower"},
+    "Biomass": {"name": "BiomassPower"},
+    "Electricity Load": {"name": "ElectricityLoad", "activity": 2},
+    "Electricity Import": {"name": "ElectricityMix", "activity": 3},
+    "Electricity Export": {"name": "ElectricityMix", "activity": 4},
 }
 
 # Expected Full-Load-Hour ranges per source (FSD §2)
-# Added placeholders for new sources.
 FLH_RANGES = {
     "Solar": (800, 1200),
     "Wind Onshore": (1800, 3000),
@@ -185,7 +187,10 @@ def get_type_mapping(api_key: str) -> dict[str, int]:
 
     # Map our labels to API names
     mapping: dict[str, int] = {}
-    for label, api_name in SOURCE_LABELS.items():
+    for label, info in SOURCE_LABELS.items():
+        api_name = info["name"]
+        if api_name == "Virtual":
+            continue
         if api_name in api_name_to_id:
             mapping[label] = api_name_to_id[api_name]
         else:
@@ -203,7 +208,8 @@ def get_type_mapping(api_key: str) -> dict[str, int]:
     return mapping
 
 
-def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | None = None) -> pd.DataFrame:
+def fetch_year_data(api_key: str, type_id: int, year: int,
+                    start_date: str | None = None, activity: int = 1) -> pd.DataFrame:
     """
     Fetch hourly data for one source/year.
     Extracts percentage (0-1) and volume (converted to MW).
@@ -218,7 +224,7 @@ def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | Non
         "granularity": 5,            # Hour
         "granularitytimezone": 0,     # UTC
         "classification": 2,         # Current (actual)
-        "activity": 1,               # Providing
+        "activity": activity,        # Providing, Consuming, Import, or Export
         "validfrom[after]": start_date,
         "validfrom[strictly_before]": f"{year + 1}-01-01",
         "itemsPerPage": 500,
@@ -466,9 +472,10 @@ def verify_data(df: pd.DataFrame, year: int) -> pd.DataFrame:
         flh = series.sum()
         
         # Check if we have a range for this source
-        lo, hi = FLH_RANGES.get(label, (0, 8760))
-
-        if lo <= flh <= hi:
+        lo, hi = FLH_RANGES.get(label, (0, 0))
+        if hi == 0:
+            flh_row[label] = "N/A"
+        elif lo <= flh <= hi:
             flh_row[label] = f"✅ {flh:.0f} h"
         else:
             flh_row[label] = f"⚠️ {flh:.0f} h (exp {lo}–{hi})"
@@ -569,8 +576,11 @@ def main():
             year_frames_list: list[pd.DataFrame] = []
 
             for label, tid in type_map.items():
-                with st.spinner(f"  ↳ {label} ({yr})..."):
-                    df_source = fetch_year_data(api_key, tid, yr, start_date=start_date_param)
+                act = SOURCE_LABELS.get(label, {}).get("activity", 1)
+                with st.spinner(f"  ↳ {label} ({yr}, activity {act})..."):
+                    df_source = fetch_year_data(api_key, tid, yr, 
+                                                start_date=start_date_param,
+                                                activity=act)
                     if not df_source.empty:
                         # Rename columns to Source (%) and Source (MW)
                         df_source = df_source.rename(columns={
@@ -644,6 +654,12 @@ def main():
         combined = pd.concat(all_data.values()).sort_index()
         combined = combined[~combined.index.duplicated(keep="first")]
 
+        # ── Virtual Columns ──
+        if "Electricity Import (MW)" in combined.columns and "Electricity Export (MW)" in combined.columns:
+            combined["Electricity Net Import (MW)"] = combined["Electricity Import (MW)"] - combined["Electricity Export (MW)"]
+            # Add to SOURCE_LABELS dynamically for selection
+            SOURCE_LABELS["Electricity Net Import"] = {"name": "Virtual"}
+
         # ── Dashboard controls ──
         st.header("📈 Dashboard")
 
@@ -703,8 +719,10 @@ def main():
         suffix = " (%)" if data_type == "Capacity Factor (%)" else " (MW)"
         colors = {
             "Solar": "#FFB300", "Wind Onshore": "#43A047", "Wind Offshore": "#1E88E5",
-            "Biogas": "#8D6E63", "Nuclear": "#9C27B0", "Fossil Gas": "#757575",
-            "Fossil Coal": "#212121", "Waste": "#795548", "Biomass": "#66BB6A"
+            "Biogas": "#8D6E63", "Nuclear": "#00E5FF", "Fossil Gas": "#B0BEC5",
+            "Fossil Coal": "#263238", "Waste": "#7E57C2", "Biomass": "#C0CA33",
+            "Electricity Load": "#D81B60", "Electricity Import": "#00897B", 
+            "Electricity Export": "#F4511E", "Electricity Net Import": "#004D40"
         }
 
         # ── Graph 1: Individual Profiles ──
