@@ -35,13 +35,26 @@ SOURCE_LABELS = {
     "Solar": "Solar",
     "Wind Onshore": "Wind",
     "Wind Offshore": "WindOffshoreC",
+    "Biogas": "Biogas",
+    "Nuclear": "Nuclear",
+    "Fossil Gas": "FossilGasPower",
+    "Fossil Coal": "FossilHardCoal",
+    "Waste": "WastePower",
+    "Biomass": "BiomassPower",
 }
 
 # Expected Full-Load-Hour ranges per source (FSD §2)
+# Added placeholders for new sources.
 FLH_RANGES = {
     "Solar": (800, 1200),
     "Wind Onshore": (1800, 3000),
     "Wind Offshore": (3000, 5000),
+    "Biogas": (4000, 8000),
+    "Nuclear": (7000, 8760),
+    "Fossil Gas": (1000, 6000),
+    "Fossil Coal": (1000, 6000),
+    "Waste": (4000, 8000),
+    "Biomass": (4000, 8000),
 }
 
 
@@ -190,15 +203,15 @@ def get_type_mapping(api_key: str) -> dict[str, int]:
     return mapping
 
 
-def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | None = None) -> pd.Series:
+def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | None = None) -> pd.DataFrame:
     """
-    Fetch hourly percentage (capacity factor) for one source/year.
-    Uses JSON-LD format for hydra:next pagination.
-    Returns a pandas Series indexed by UTC timestamp.
+    Fetch hourly data for one source/year.
+    Extracts percentage (0-1) and volume (converted to MW).
+    Returns a pandas DataFrame indexed by UTC timestamp.
     """
     if start_date is None:
         start_date = f"{year}-01-01"
-    # Initial request uses params dict for proper URL encoding
+
     initial_params = {
         "point": 0,
         "type": type_id,
@@ -208,11 +221,12 @@ def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | Non
         "activity": 1,               # Providing
         "validfrom[after]": start_date,
         "validfrom[strictly_before]": f"{year + 1}-01-01",
-        "itemsPerPage": 200,         # reduce page count
+        "itemsPerPage": 500,
     }
 
     timestamps: list[str] = []
-    values: list[float] = []
+    percentages: list[float] = []
+    volumes_mw: list[float] = []
     page = 0
     progress = st.empty()
 
@@ -222,9 +236,9 @@ def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | Non
 
     while True:
         if page > 0:
-            time.sleep(1)  # rate limiting between pagination calls
+            time.sleep(0.5)  # slightly faster rate limiting
 
-        progress.text(f"Page {page + 1} — {len(values)} records so far...")
+        progress.text(f"Page {page + 1} — {len(percentages)} records so far...")
 
         try:
             if use_params:
@@ -264,9 +278,12 @@ def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | Non
         for item in items:
             ts = item.get("validfrom", "")
             pct = item.get("percentage", 0.0)
+            vol_kwh = item.get("volume", 0.0)
             if ts:
                 timestamps.append(ts)
-                values.append(float(pct))
+                percentages.append(float(pct))
+                # volume in kWh for 1 hour = mean power in kW. divide by 1000 for MW.
+                volumes_mw.append(float(vol_kwh) / 1000.0)
 
         # Follow pagination — JSON-LD: hydra:view → hydra:next
         next_url = None
@@ -291,20 +308,17 @@ def fetch_year_data(api_key: str, type_id: int, year: int, start_date: str | Non
             break   # no more pages
 
         page += 1
-
     progress.empty()
 
-    if not values:
+    if not timestamps:
         st.warning(f"No data returned for type {type_id}, year {year}.")
-        return pd.Series(dtype=float)
+        return pd.DataFrame()
 
-    series = pd.Series(values, index=pd.to_datetime(timestamps, utc=True), name="percentage")
-
-    # Normalize: if max > 1.5, data is in 0-100 → convert to 0-1
-    if series.max() > 1.5:
-        series = series / 100.0
-
-    return series.sort_index()
+    df = pd.DataFrame(
+        {"pct": percentages, "mw": volumes_mw},
+        index=pd.to_datetime(timestamps, utc=True)
+    )
+    return df.sort_index()
 
 
 # ── Excel caching ──────────────────────────────────────────────────────
@@ -425,36 +439,37 @@ def verify_data(df: pd.DataFrame, year: int) -> pd.DataFrame:
     report_rows.append({
         "Test": "Completeness",
         "Details": f"{rows} rows (expected {expected_max})",
-        "Solar": comp_status,
-        "Wind Onshore": comp_status,
-        "Wind Offshore": comp_status,
+        **{label: comp_status for label in SOURCE_LABELS.keys()}
     })
 
     # ── Test 2 & 3 per column ──
-    flh_row = {"Test": "Full Load Hours", "Details": "Sum of CF"}
+    flh_row = {"Test": "Full Load Hours", "Details": "Sum of %"}
     physics_row = {"Test": "Physics Check", "Details": "Values in [0, 1.05]"}
 
-    for col in ["Solar", "Wind Onshore", "Wind Offshore"]:
+    for label in SOURCE_LABELS.keys():
+        col = f"{label} (%)"
         if col not in df.columns:
-            flh_row[col] = "❌ Missing"
-            physics_row[col] = "❌ Missing"
+            flh_row[label] = "❌ Missing"
+            physics_row[label] = "❌ Missing"
             continue
 
         series = df[col].astype(float)
         flh = series.sum()
-        lo, hi = FLH_RANGES[col]
+        
+        # Check if we have a range for this source
+        lo, hi = FLH_RANGES.get(label, (0, 8760))
 
         if lo <= flh <= hi:
-            flh_row[col] = f"✅ {flh:.0f} h"
+            flh_row[label] = f"✅ {flh:.0f} h"
         else:
-            flh_row[col] = f"⚠️ {flh:.0f} h (exp {lo}–{hi})"
+            flh_row[label] = f"⚠️ {flh:.0f} h (exp {lo}–{hi})"
 
         neg = (series < 0).sum()
         over = (series > 1.05).sum()
         if neg == 0 and over == 0:
-            physics_row[col] = "✅ Pass"
+            physics_row[label] = "✅ Pass"
         else:
-            physics_row[col] = f"❌ {neg} neg, {over} >1.05"
+            physics_row[label] = f"❌ {neg} neg, {over} >1.05"
 
     report_rows.append(flh_row)
     report_rows.append(physics_row)
@@ -464,7 +479,8 @@ def verify_data(df: pd.DataFrame, year: int) -> pd.DataFrame:
 
 def clamp_physics(df: pd.DataFrame) -> pd.DataFrame:
     """Clamp capacity factor values: negatives → 0, >1.0 → 1.0."""
-    for col in ["Solar", "Wind Onshore", "Wind Offshore"]:
+    for label in SOURCE_LABELS.keys():
+        col = f"{label} (%)"
         if col in df.columns:
             df[col] = df[col].clip(lower=0.0, upper=1.0)
     return df
@@ -534,33 +550,35 @@ def main():
             else:
                 st.subheader(f"Fetching {yr}...")
 
-            year_frames: dict[str, pd.Series] = {}
+            year_frames_list: list[pd.DataFrame] = []
 
             for label, tid in type_map.items():
                 with st.spinner(f"  ↳ {label} ({yr})..."):
-                    series = fetch_year_data(api_key, tid, yr, start_date=start_date_param)
-                    if not series.empty:
-                        year_frames[label] = series
+                    df_source = fetch_year_data(api_key, tid, yr, start_date=start_date_param)
+                    if not df_source.empty:
+                        # Rename columns to Source (%) and Source (MW)
+                        df_source = df_source.rename(columns={
+                            'pct': f"{label} (%)", 
+                            'mw': f"{label} (MW)"
+                        })
+                        year_frames_list.append(df_source)
 
-            if year_frames:
-                df_new = pd.DataFrame(year_frames)
+            if year_frames_list:
+                df_new = pd.concat(year_frames_list, axis=1)
                 df_new.index.name = "timestamp_utc"
-                
+
                 # If updating the current year, merge with existing
                 if yr in all_data and yr == current_year:
-                    # Concat places new data after old data.
+                    # Merge on index, prioritize new data
                     df_year = pd.concat([all_data[yr], df_new])
-                    # Keep the last fetched value (new data) in case of overlap
-                    df_year = df_year[~df_year.index.duplicated(keep="last")]
-                    # Sort after deduplication
-                    df_year = df_year.sort_index()
+                    df_year = df_year[~df_year.index.duplicated(keep="last")].sort_index()
                 else:
                     df_year = df_new
 
                 save_year(EXCEL_FILE, yr, df_year)
                 all_data[yr] = df_year
                 if start_date_param:
-                    st.success(f"✅ {yr}: appended {len(df_new)} new rows, total {len(df_year)} rows saved.")
+                    st.success(f"✅ {yr}: appended {len(df_new)} periods, total {len(df_year)} rows saved.")
                 else:
                     st.success(f"✅ {yr}: saved {len(df_year)} rows to {EXCEL_FILE}")
             else:
@@ -639,105 +657,121 @@ def main():
             st.warning("No data in the selected range.")
             st.stop()
 
-        # View mode
-        view_mode = st.radio("View Mode", ["Individual Profiles", "Stacked Simulation"], horizontal=True)
+        # View options
+        ui_col1, ui_col2 = st.columns(2)
+        with ui_col1:
+            data_type = st.radio("Data Type", ["Capacity Factor (%)", "Production (MW)"], horizontal=True)
+        with ui_col2:
+            view_mode = st.radio("View Mode", ["Individual Profiles", "Stacked Generation"], horizontal=True)
+
+        # Source Selection
+        all_labels = list(SOURCE_LABELS.keys())
+        default_sources = ["Solar", "Wind Onshore", "Wind Offshore"]
+        available_sources = [label for label in all_labels if f"{label} (%)" in df_view.columns]
+        
+        selected_sources = st.multiselect(
+            "Select Energy Sources",
+            options=available_sources,
+            default=[s for s in default_sources if s in available_sources]
+        )
+
+        if not selected_sources:
+            st.info("Select at least one energy source to display.")
+            st.stop()
+
+        suffix = " (%)" if data_type == "Capacity Factor (%)" else " (MW)"
+        colors = {
+            "Solar": "#FFB300", "Wind Onshore": "#43A047", "Wind Offshore": "#1E88E5",
+            "Biogas": "#8D6E63", "Nuclear": "#9C27B0", "Fossil Gas": "#757575",
+            "Fossil Coal": "#212121", "Waste": "#795548", "Biomass": "#66BB6A"
+        }
 
         # ── Graph 1: Individual Profiles ──
         if view_mode == "Individual Profiles":
-            cols_to_show = []
-            cb_col1, cb_col2, cb_col3 = st.columns(3)
-            with cb_col1:
-                if st.checkbox("Solar", value=True):
-                    cols_to_show.append("Solar")
-            with cb_col2:
-                if st.checkbox("Wind Onshore", value=True):
-                    cols_to_show.append("Wind Onshore")
-            with cb_col3:
-                if st.checkbox("Wind Offshore", value=True):
-                    cols_to_show.append("Wind Offshore")
-
-            if not cols_to_show:
-                st.info("Select at least one source.")
-                st.stop()
-
-            colors = {"Solar": "#FFB300", "Wind Onshore": "#43A047", "Wind Offshore": "#1E88E5"}
-
             fig = go.Figure()
-            for col in cols_to_show:
+            for label in selected_sources:
+                col = label + suffix
                 if col in df_view.columns:
                     fig.add_trace(go.Scatter(
                         x=df_view.index,
                         y=df_view[col],
                         mode="lines",
-                        name=col,
-                        line=dict(color=colors.get(col, None), width=1),
+                        name=label,
+                        line=dict(color=colors.get(label), width=1.5),
                     ))
 
             fig.update_layout(
-                title="Capacity Factor Profiles",
-                yaxis=dict(title="Capacity Factor", range=[0, 1.05]),
+                title=f"{data_type} over Time",
+                yaxis=dict(title=data_type),
                 xaxis=dict(title="Time (UTC)"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 height=500,
                 template="plotly_white",
             )
+            if data_type == "Capacity Factor (%)":
+                fig.update_layout(yaxis=dict(range=[0, 1.05]))
+            
             st.plotly_chart(fig, use_container_width=True)
 
-        # ── Graph 2: Stacked Simulation ──
+        # ── Graph 2: Stacked Generation ──
         else:
-            st.subheader("Installed Capacity Assumptions")
-            sim_col1, sim_col2, sim_col3 = st.columns(3)
-            with sim_col1:
-                cap_solar = st.number_input("Solar (GW)", min_value=0.0, value=10.0, step=1.0)
-            with sim_col2:
-                cap_onshore = st.number_input("Wind Onshore (GW)", min_value=0.0, value=10.0, step=1.0)
-            with sim_col3:
-                cap_offshore = st.number_input("Wind Offshore (GW)", min_value=0.0, value=10.0, step=1.0)
-
-            # Compute P(t) = C × CF(t)  — GW × capacity factor = GW output
-            p_solar = df_view.get("Solar", pd.Series(0, index=df_view.index)) * cap_solar
-            p_onshore = df_view.get("Wind Onshore", pd.Series(0, index=df_view.index)) * cap_onshore
-            p_offshore = df_view.get("Wind Offshore", pd.Series(0, index=df_view.index)) * cap_offshore
+            if data_type == "Capacity Factor (%)":
+                st.subheader("Simulated Generation (Installed Capacity Assumptions)")
+                st.caption("Enter hypothetical installed capacities (GW) to simulate power output.")
+                cap_cols = st.columns(len(selected_sources))
+                caps = {}
+                for i, label in enumerate(selected_sources):
+                    with cap_cols[i]:
+                        caps[label] = st.number_input(f"{label} (GW)", min_value=0.0, value=10.0, step=1.0)
+                
+                # Compute P(t) = C × CF(t)
+                plot_data = {
+                    label: df_view[f"{label} (%)"] * caps[label]
+                    for label in selected_sources
+                }
+                title = "Simulated Renewable Power Output"
+                y_title = "Power Output (GW)"
+            else:
+                st.subheader("Actual Hourly Generation Stack")
+                plot_data = {
+                    label: df_view[f"{label} (MW)"]
+                    for label in selected_sources
+                }
+                title = "Actual Power Generation (from NED API)"
+                y_title = "Power Output (MW)"
 
             fig = go.Figure()
-
-            fig.add_trace(go.Scatter(
-                x=df_view.index, y=p_solar,
-                mode="lines", name="Solar",
-                line=dict(width=0), fillcolor="rgba(255, 179, 0, 0.6)",
-                stackgroup="one",
-            ))
-            fig.add_trace(go.Scatter(
-                x=df_view.index, y=p_onshore,
-                mode="lines", name="Wind Onshore",
-                line=dict(width=0), fillcolor="rgba(67, 160, 71, 0.6)",
-                stackgroup="one",
-            ))
-            fig.add_trace(go.Scatter(
-                x=df_view.index, y=p_offshore,
-                mode="lines", name="Wind Offshore",
-                line=dict(width=0), fillcolor="rgba(30, 136, 229, 0.6)",
-                stackgroup="one",
-            ))
+            for label in selected_sources:
+                fig.add_trace(go.Scatter(
+                    x=df_view.index, y=plot_data[label],
+                    mode="lines", name=label,
+                    line=dict(width=0), 
+                    fillcolor=colors.get(label, "grey"),
+                    stackgroup="one",
+                ))
 
             fig.update_layout(
-                title="Simulated Renewable Power Output",
-                yaxis=dict(title="Power Output (GW)"),
+                title=title,
+                yaxis=dict(title=y_title),
                 xaxis=dict(title="Time (UTC)"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                height=500,
+                height=550,
                 template="plotly_white",
             )
             st.plotly_chart(fig, use_container_width=True)
 
             # Summary stats for the selected range
-            total = p_solar + p_onshore + p_offshore
+            total = pd.DataFrame(plot_data).sum(axis=1)
+            unit = "GW" if data_type == "Capacity Factor (%)" else "MW"
+            total_unit = "TWh" if data_type == "Capacity Factor (%)" else "GWh"
+            divisor = 1000.0
+            
             st.markdown(f"""
-            **Selected range statistics:**
-            - Peak combined output: **{total.max():.1f} GW**
-            - Average combined output: **{total.mean():.1f} GW**
-            - Minimum combined output: **{total.min():.1f} GW**
-            - Total energy: **{total.sum() / 1000:.1f} TWh** (assuming hourly data)
+            **Selected range statistics ({data_type}):**
+            - Peak combined output: **{total.max():.1f} {unit}**
+            - Average combined output: **{total.mean():.1f} {unit}**
+            - Minimum combined output: **{total.min():.1f} {unit}**
+            - Total energy: **{total.sum() / divisor:.1f} {total_unit}** (assuming hourly data)
             """)
 
     # ── Gas Price Chart ──
