@@ -519,6 +519,11 @@ def main():
             st.error("Start year must be ≤ end year.")
             st.stop()
 
+        force_refetch = st.checkbox(
+            "Force Refetch", 
+            help="Overwrite existing cache to retrieve newly added energy sources and MW production data."
+        )
+
         fetch_btn = st.button("📥 Fetch Data", type="primary", use_container_width=True)
 
     # ── Load existing data ──
@@ -543,19 +548,21 @@ def main():
         st.info(f"Resolved types: {type_map}")
 
         for yr in years:
-            if yr in all_data and yr < current_year:
+            if yr in all_data and yr < current_year and not force_refetch:
                 st.info(f"📋 Year {yr} already cached — skipping download.")
                 continue
 
-            # For current year, fetch incrementally starting from latest timestamp
+            # For current year or force refetch, fetch incrementally if possible.
+            # NOTE: For a full 'Force Refetch' of an old year, we might want to start from 01-01.
             start_date_param = None
-            if yr in all_data and yr == current_year:
-                last_dt = all_data[yr].index.max()
-                if pd.notnull(last_dt):
-                    # API uses > validation for [after], so requesting the same day is fine.
-                    # Duplicates are dropped later. We request from the date of the last timestamp.
-                    start_date_param = last_dt.strftime("%Y-%m-%d")
-                    st.info(f"🔄 Current year {yr} partially cached. Fetching updates from {start_date_param}...")
+            if yr in all_data:
+                if yr == current_year and not force_refetch:
+                    last_dt = all_data[yr].index.max()
+                    if pd.notnull(last_dt):
+                        start_date_param = last_dt.strftime("%Y-%m-%d")
+                        st.info(f"🔄 Year {yr} partially cached. Fetching updates from {start_date_param}...")
+                elif force_refetch:
+                    st.info(f"🚀 Force refetching {yr} to include all sources and MW data...")
             else:
                 st.subheader(f"Fetching {yr}...")
 
