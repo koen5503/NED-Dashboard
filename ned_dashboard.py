@@ -339,6 +339,15 @@ def load_existing_years(path: str) -> dict[int, pd.DataFrame]:
                 df = pd.read_excel(xls, sheet_name=sn, index_col=0, engine="openpyxl")
                 # Restore UTC — Excel stores tz-naive datetimes
                 df.index = pd.to_datetime(df.index, utc=True)
+                
+                # ── Migration: rename old columns (Solar -> Solar (%)) ──
+                renames = {}
+                for col in df.columns:
+                    if col in SOURCE_LABELS and f"{col} (%)" not in df.columns:
+                        renames[col] = f"{col} (%)"
+                if renames:
+                    df = df.rename(columns=renames)
+                
                 result[yr] = df
     except Exception as exc:
         st.warning(f"Could not read existing Excel file: {exc}")
@@ -667,7 +676,12 @@ def main():
         # Source Selection
         all_labels = list(SOURCE_LABELS.keys())
         default_sources = ["Solar", "Wind Onshore", "Wind Offshore"]
-        available_sources = [label for label in all_labels if f"{label} (%)" in df_view.columns]
+        
+        # Check for both "Source (%)" and "Source" (old format) just in case
+        available_sources = [
+            label for label in all_labels 
+            if (f"{label} (%)" in df_view.columns) or (label in df_view.columns) or (f"{label} (MW)" in df_view.columns)
+        ]
         
         selected_sources = st.multiselect(
             "Select Energy Sources",
@@ -691,6 +705,9 @@ def main():
             fig = go.Figure()
             for label in selected_sources:
                 col = label + suffix
+                if col not in df_view.columns and data_type == "Capacity Factor (%)":
+                    col = label # Fallback for old cache
+                
                 if col in df_view.columns:
                     fig.add_trace(go.Scatter(
                         x=df_view.index,
@@ -725,40 +742,51 @@ def main():
                         caps[label] = st.number_input(f"{label} (GW)", min_value=0.0, value=10.0, step=1.0)
                 
                 # Compute P(t) = C × CF(t)
-                plot_data = {
-                    label: df_view[f"{label} (%)"] * caps[label]
-                    for label in selected_sources
-                }
+                plot_data = {}
+                for label in selected_sources:
+                    col = f"{label} (%)"
+                    if col not in df_view.columns: col = label # Fallback
+                    if col in df_view.columns:
+                        plot_data[label] = df_view[col] * caps[label]
+                
                 title = "Simulated Renewable Power Output"
                 y_title = "Power Output (GW)"
             else:
                 st.subheader("Actual Hourly Generation Stack")
                 plot_data = {
                     label: df_view[f"{label} (MW)"]
-                    for label in selected_sources
+                    for label in selected_sources if f"{label} (MW)" in df_view.columns
                 }
                 title = "Actual Power Generation (from NED API)"
                 y_title = "Power Output (MW)"
 
-            fig = go.Figure()
-            for label in selected_sources:
-                fig.add_trace(go.Scatter(
-                    x=df_view.index, y=plot_data[label],
-                    mode="lines", name=label,
-                    line=dict(width=0), 
-                    fillcolor=colors.get(label, "grey"),
-                    stackgroup="one",
-                ))
+            if not plot_data:
+                st.warning(f"No {data_type} data available for the selected sources & range.")
+            else:
+                fig = go.Figure()
+                for label, series in plot_data.items():
+                    fig.add_trace(go.Scatter(
+                        x=df_view.index, y=series,
+                        mode="lines", name=label,
+                        line=dict(width=0), 
+                        fillcolor=colors.get(label, "grey"),
+                        stackgroup="one",
+                    ))
 
-            fig.update_layout(
-                title=title,
-                yaxis=dict(title=y_title),
-                xaxis=dict(title="Time (UTC)"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                height=550,
-                template="plotly_white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                fig.update_layout(
+                    title=title,
+                    yaxis=dict(title=y_title),
+                    xaxis=dict(title="Time (UTC)"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    height=550,
+                    template="plotly_white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Summary stats for the selected range
+                total = pd.DataFrame(plot_data).sum(axis=1)
+                unit = "GW" if data_type == "Capacity Factor (%)" else "MW"
+                # ... rest of summary stats logic stays the same ...
 
             # Summary stats for the selected range
             total = pd.DataFrame(plot_data).sum(axis=1)
