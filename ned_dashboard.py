@@ -827,8 +827,17 @@ def main():
                             line=dict(width=0), fillcolor=colors.get(label, "grey"),
                             stackgroup="one",
                         ))
+                    
+                    # Overlay Electricity Load
+                    load_series = df_view.get("Electricity Load (MW)", pd.Series(0, index=df_view.index))
+                    fig1.add_trace(go.Scatter(
+                        x=df_view.index, y=load_series,
+                        mode="lines", name="Electricity Load (Line)",
+                        line=dict(color=colors.get("Electricity Load", "#D81B60"), width=3),
+                    ))
+
                     fig1.update_layout(
-                        title="Total Hourly Production Stack (MW)",
+                        title="Total Hourly Production Stack (MW) vs Load",
                         yaxis=dict(title="Power (MW)"),
                         xaxis=dict(title="Time (UTC)"),
                         height=450,
